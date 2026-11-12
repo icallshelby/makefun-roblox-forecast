@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""Entry for make.fun bounty roblox-up-and-coming-forecast-01 (v3).
+"""Entry for make.fun bounty roblox-up-and-coming-forecast-01 (v4).
 
 Forecasts Roblox's Up-and-Coming top 10 for the 72 hours after the history
-ends. v3 is a fixed-weight ensemble of the two earlier forecasters, both
-fit from /input/history.ndjson alone, standard library only:
+ends. v4 keeps the v3 fixed-weight ensemble (both fit from
+/input/history.ndjson alone, standard library only) and retunes it on the
+20-origin local harness (exact RULES scorer; v3: mean -37.929, headline
+-38.674; v4: mean -37.606, headline -38.586):
 
-  * v1 (weight 0.6): plain least-squares lognormal rank diffusion --
+  * v1 (weight 0.5): plain least-squares lognormal rank diffusion --
     ln(rank at +h hours) Gaussian with mean a + b*ln(rank now) + c*ln(h)
     plus a momentum shift (recent ln-rank drift weight 0.7, ln(playing)
     growth weight 0.2 against it, segment >= ~15h, extrapolated at most
     48h), spread growing with ln(h), and a per-gap off-chart rate.
-  * v2 (weight 0.4): the same diffusion refit with recency-weighted
-    pairs (tau 5 days), off-chart rates split by origin-rank band,
+  * v2 (weight 0.5): the same diffusion refit with recency-weighted
+    pairs (tau 3 days, was 5), off-chart rates split by origin-rank band,
     a >= ~10h momentum segment extrapolated at most 72h, a saturation
-    level term (0.06 per z of ln(playing)), and a 28-day age-out.
+    HINGE term (mean rank worsens 0.3 per z of ln(playing) above z=0.5
+    only; the old linear 0.06/z term is gone), and a 28-day age-out.
 
 The blend is taken on the per-place probability vectors themselves:
-raw = 0.6 * raw_v1 + 0.4 * raw_v2 elementwise, and the per-place
+raw = 0.5 * raw_v1 + 0.5 * raw_v2 elementwise, and the per-place
 coverage targets are blended with the same weights, before the shared
-assembly step scales each place to its target. On the house dev split
-v1 graded better than v2, so the blend leans toward v1 while keeping
-v2's fresher-window signal in the mix.
+assembly step scales each place to its target. Two more calibration
+changes: coverage targets are no longer shrunk (COV_MULT 1.00, was
+0.95), and rows below p = 0.001 are dropped at assembly (MIN_P 0.001,
+was 0.0004) -- the scorer's fallback for an unnamed holder averages
+~0.005, so naming a game below ~0.001 is worse than leaving it unnamed.
 
 Deterministic: no randomness, no clock, sorted iteration only.
 Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR
@@ -32,19 +37,21 @@ import os
 from datetime import datetime
 
 PLACES_FALLBACK = 10
-MIN_P = 0.0004
+MIN_P = 0.001         # v4: rows below this are dropped (scorer fallback for an
+                      # unnamed holder averages ~0.005, so tiny names lose)
 KAPPA_RANK = 0.7      # weight on recent ln-rank drift
 KAPPA_PLAY = 0.2      # weight on recent ln(playing) growth (rank improves as it grows)
 SD_MULT = 1.08        # spread calibration
-COV_MULT = 0.95       # coverage calibration
+COV_MULT = 1.00       # v4: coverage calibration (was 0.95)
 DRIFT_MIN_H = 10.0    # v2: minimum momentum segment length in hours (v1 used 15)
 DRIFT_CAP_H = 72.0    # v2: momentum extrapolation cap in hours (v1 used 48)
-RECENCY_TAU_DAYS = 5.0  # v2: pair-weight decay for the diffusion fit
-LEVEL_W = 0.06        # v2: saturation mean-rank penalty per z of ln(playing)
+RECENCY_TAU_DAYS = 3.0  # v4: pair-weight decay for the diffusion fit (was 5.0)
+SAT_W = 0.3           # v4: saturation hinge slope per z of ln(playing) above SAT_Z
+SAT_Z = 0.5           # v4: saturation hinge threshold (z-score)
 GAP_CENTRES = [3, 5, 8, 12, 18, 27, 40, 60, 90, 135]
 RANK_BANDS = [(1, 5), (6, 15), (16, 40), (41, 10 ** 9)]
-W_V1 = 0.6            # ensemble weight on the v1 forecaster
-W_V2 = 0.4            # ensemble weight on the v2 forecaster
+W_V1 = 0.5            # v4: ensemble weight on the v1 forecaster (was 0.6)
+W_V2 = 0.5            # v4: ensemble weight on the v2 forecaster (was 0.4)
 
 
 def parse_time(s):
@@ -268,7 +275,8 @@ def model_forecast(reads, places):
         drift = KAPPA_RANK * mu_rank - KAPPA_PLAY * mu_play
         shift = 0.0
         if uid in lp:
-            shift += LEVEL_W * (lp[uid] - lp_mu) / max(lp_sd, 1e-9)
+            z = (lp[uid] - lp_mu) / max(lp_sd, 1e-9)
+            shift += SAT_W * max(0.0, z - SAT_Z)
         exit_h = None
         if uid in born:
             exit_h = (28.0 * 86400.0 - (last['t'] - born[uid])) / 3600.0
@@ -467,7 +475,7 @@ def assemble(raw, targets, places):
 
 def ensemble_forecast(reads, places):
     """Run both forecasters on the same reads and blend their per-place
-    probability vectors with fixed weights (0.6 v1 / 0.4 v2). If exactly
+    probability vectors with fixed weights (0.5 v1 / 0.5 v2). If exactly
     one model fails to fit, the other is used on its own."""
     built1 = model_forecast_v1(reads, places)
     built2 = model_forecast(reads, places)

@@ -10,11 +10,11 @@ for each of the top 10 places, a probability for each game it names being
 at that place, plus its guessed top 10 in order. The forecast is scored
 against every hourly read of the 72 hours after the history ends.
 
-## Model (v3: fixed-weight ensemble of v1 + v2)
+## Model (v4: fixed-weight ensemble of v1 + v2, retuned)
 
 `main.py` runs both earlier forecasters on the same history and blends
 their per-place probability vectors elementwise with fixed weights —
-0.6 on v1, 0.4 on v2 — and blends the per-place coverage targets with
+0.5 on v1, 0.5 on v2 — and blends the per-place coverage targets with
 the same weights before the shared assembly step.
 
 * v1: future ranks are modelled in log space: `ln(rank at +h hours)` is
@@ -23,16 +23,20 @@ the same weights before the shared assembly step.
   every (read, later read) pair; momentum from the latest >= ~15h
   segment, extrapolated at most 48h.
 * v2: the same diffusion with pairs weighted toward the recent end
-  (exponential decay, tau 5 days), off-chart rates also split by
+  (exponential decay, tau 3 days), off-chart rates also split by
   origin-rank band, a >= ~10h momentum segment extrapolated at most
-  72h, a saturation term (ln(playing) level z-scored across the chart,
-  0.06 per z), and a 28-day age-out for games whose creation date a
-  read's details carry.
+  72h, a saturation HINGE term (ln(playing) z-scored across the chart,
+  mean rank worsens 0.3 per z above z = 0.5 only), and a 28-day age-out
+  for games whose creation date a read's details carry.
 * Both members average their per-place distributions over h = 1..72;
   the blended forecast is scaled per place to the blended empirical
-  coverage target (x0.95). The unnamed remainder is left for the scorer
-  to share over unnamed games, which covers genuinely new chart
-  entries.
+  coverage target (x1.00, unshrunk). Rows below p = 0.001 are dropped
+  at assembly: the scorer's fallback for an unnamed holder averages
+  ~0.005, so naming a game below ~0.001 is worse than leaving it
+  unnamed. The unnamed remainder is left for the scorer to share over
+  unnamed games, which covers genuinely new chart entries.
 
-The program is deterministic: two runs on the same history write the
-same bytes.
+Local harness (exact RULES scorer, 20 origins): v4 mean -37.606,
+headline -38.586, worst -42.388, against v3's -37.929 / -38.674 /
+-42.198. The program is deterministic: two runs on the same history
+write the same bytes.
