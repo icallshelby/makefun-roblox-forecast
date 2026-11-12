@@ -10,7 +10,7 @@ for each of the top 10 places, a probability for each game it names being
 at that place, plus its guessed top 10 in order. The forecast is scored
 against every hourly read of the 72 hours after the history ends.
 
-## Model (v4: fixed-weight ensemble of v1 + v2, retuned)
+## Model (v5: v4 ensemble + tenure hazard + horizon mixture)
 
 `main.py` runs both earlier forecasters on the same history and blends
 their per-place probability vectors elementwise with fixed weights —
@@ -28,6 +28,15 @@ the same weights before the shared assembly step.
   72h, a saturation HINGE term (ln(playing) z-scored across the chart,
   mean rank worsens 0.3 per z above z = 0.5 only), and a 28-day age-out
   for games whose creation date a read's details carry.
+* v5 adds, to BOTH members: TENURE — a game's chart age (days since
+  first seen in the history) shifts its drift by +0.04 ln-rank per day
+  of age per day (young games keep climbing, old games fade; measured
+  age 0-1d improves ln-rank -0.21 at +24h, age 4-7d worsens +0.09);
+  and HORIZON MIXTURE — the diffusion is fit separately on short pairs
+  (gap <= 12h: persistence 0.92, resid sd 0.37) and long pairs
+  (gap > 12h: 0.64, 0.73), each forecast horizon using the matching
+  fit. Short-window breakout momentum was measured and rejected: it
+  costs mean at every weight tried.
 * Both members average their per-place distributions over h = 1..72;
   the blended forecast is scaled per place to the blended empirical
   coverage target (x1.00, unshrunk). Rows below p = 0.001 are dropped
@@ -36,7 +45,8 @@ the same weights before the shared assembly step.
   unnamed. The unnamed remainder is left for the scorer to share over
   unnamed games, which covers genuinely new chart entries.
 
-Local harness (exact RULES scorer, 20 origins): v4 mean -37.606,
-headline -38.586, worst -42.388, against v3's -37.929 / -38.674 /
--42.198. The program is deterministic: two runs on the same history
-write the same bytes.
+Local harness (exact RULES scorer, 20 origins): v5 mean -36.727,
+headline -38.068, worst -42.571, against v4's -37.606 / -38.586 /
+-42.388 (v3: -37.929 / -38.674 / -42.198). On the later half of
+origins v5 means -36.502 vs v4's -37.538. The program is deterministic:
+two runs on the same history write the same bytes.

@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
-"""Entry for make.fun bounty roblox-up-and-coming-forecast-01 (v4).
+"""Entry for make.fun bounty roblox-up-and-coming-forecast-01 (v5).
 
 Forecasts Roblox's Up-and-Coming top 10 for the 72 hours after the history
-ends. v4 keeps the v3 fixed-weight ensemble (both fit from
-/input/history.ndjson alone, standard library only) and retunes it on the
-20-origin local harness (exact RULES scorer; v3: mean -37.929, headline
--38.674; v4: mean -37.606, headline -38.586):
+ends. v5 keeps the v4 ensemble (0.5 v1 + 0.5 v2, tau 3d, hinge saturation,
+MIN_P 0.001, COV 1.00) and adds the two winner-pattern levers that the
+local harness validates (20-origin exact RULES scorer; v4: mean -37.606,
+headline -38.586; v5: mean -36.727, headline -38.068):
 
-  * v1 (weight 0.5): plain least-squares lognormal rank diffusion --
-    ln(rank at +h hours) Gaussian with mean a + b*ln(rank now) + c*ln(h)
-    plus a momentum shift (recent ln-rank drift weight 0.7, ln(playing)
-    growth weight 0.2 against it, segment >= ~15h, extrapolated at most
-    48h), spread growing with ln(h), and a per-gap off-chart rate.
-  * v2 (weight 0.5): the same diffusion refit with recency-weighted
-    pairs (tau 3 days, was 5), off-chart rates split by origin-rank band,
-    a >= ~10h momentum segment extrapolated at most 72h, a saturation
-    HINGE term (mean rank worsens 0.3 per z of ln(playing) above z=0.5
-    only; the old linear 0.06/z term is gone), and a 28-day age-out.
+  * TENURE (chart age): a game's age on the chart (days since first seen
+    in the history) shifts its drift: young games keep climbing, old games
+    fade (measured: age 0-1d improves ln-rank -0.21 at +24h / -0.44 at
+    +72h; age 4-7d worsens +0.09 / +0.23). TENURE_W 0.04 per day of age,
+    applied as a drift (grows with h). Birth age from details is 0%
+    available in the practice history, so chart age is the feature.
+  * HORIZON MIXTURE: the diffusion is fit separately on short pairs
+    (gap <= 12h: persistence b 0.92, resid sd 0.37) and long pairs
+    (gap > 12h: b 0.64, sd 0.73); each forecast horizon h uses the
+    matching fit instead of one compromise fit (b 0.53).
 
-The blend is taken on the per-place probability vectors themselves:
-raw = 0.5 * raw_v1 + 0.5 * raw_v2 elementwise, and the per-place
-coverage targets are blended with the same weights, before the shared
-assembly step scales each place to its target. Two more calibration
-changes: coverage targets are no longer shrunk (COV_MULT 1.00, was
-0.95), and rows below p = 0.001 are dropped at assembly (MIN_P 0.001,
-was 0.0004) -- the scorer's fallback for an unnamed holder averages
-~0.005, so naming a game below ~0.001 is worse than leaving it unnamed.
+The third winner pattern, MOMENTUM/BREAKOUT (short ~8h rank velocity),
+was measured and REJECTED: its correlation with future rank change is
+real (0.224 vs 0.187 for the long drift) but as a model term it costs
+-0.05 to -1.17 mean at every weight tried (0.05-0.7, caps 24/72h) --
+the existing drift already captures most of it and the residual is
+noise extrapolated 3 days out. Not in v5.
 
 Deterministic: no randomness, no clock, sorted iteration only.
 Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR
@@ -52,6 +50,8 @@ GAP_CENTRES = [3, 5, 8, 12, 18, 27, 40, 60, 90, 135]
 RANK_BANDS = [(1, 5), (6, 15), (16, 40), (41, 10 ** 9)]
 W_V1 = 0.5            # v4: ensemble weight on the v1 forecaster (was 0.6)
 W_V2 = 0.5            # v4: ensemble weight on the v2 forecaster (was 0.4)
+TENURE_W = 0.04       # v5: drift per day of chart age (ln-rank/day/day)
+HORIZON_SPLIT = 12.0  # v5: short/long diffusion split, hours
 
 
 def parse_time(s):
@@ -110,10 +110,11 @@ def band_of(r):
 # v2 forecaster (weight W_V2 in the ensemble)
 # ---------------------------------------------------------------------------
 
-def fit_diffusion(reads):
+def fit_diffusion(reads, gap_lo=None, gap_hi=None):
     """Recency-weighted least squares for ln r' ~ a + b ln r + c ln gap,
     spread by gap, and off-chart rates per (gap, origin-rank band).
-    Returns (a, b, c, sd_of, off_p) or None."""
+    Returns (a, b, c, sd_of, off_p) or None. gap_lo/gap_hi restrict the
+    fitted pairs by gap hours (v5 horizon mixture)."""
     xs, ys, gs, ws = [], [], [], []
     off = {}
     off_rb = {}
@@ -124,6 +125,10 @@ def fit_diffusion(reads):
             rj = reads[j]
             gap = (rj['t'] - ri['t']) / 3600.0
             if gap <= 0:
+                continue
+            if gap_lo is not None and gap < gap_lo:
+                continue
+            if gap_hi is not None and gap > gap_hi:
                 continue
             lg = math.log(gap)
             key = round(lg * 2) / 2
@@ -254,16 +259,22 @@ def coverage_targets(reads, places):
 
 def model_forecast(reads, places):
     """The v2 forecaster: returns (raw, targets) or None."""
-    fit = fit_diffusion(reads)
-    if fit is None:
+    fit_s = fit_diffusion(reads, gap_hi=HORIZON_SPLIT)
+    fit_l = fit_diffusion(reads, gap_lo=HORIZON_SPLIT)
+    if fit_s is None or fit_l is None:
         return None
-    a, b, c, sd_of, off_p = fit
+    fits = (fit_s, fit_l)
     targets = coverage_targets(reads, places)
     last = reads[-1]
     born = {}
     for rd in reads:
         for uid, ct in rd.get('created', {}).items():
             born[uid] = ct
+    first_seen = {}
+    for rd in reads:
+        for uid in rd['rank']:
+            first_seen.setdefault(uid, rd['t'])
+    age_days = {uid: (last['t'] - t0) / 86400.0 for uid, t0 in first_seen.items()}
     lp = {u: math.log(p) for u, p in last['playing'].items() if p and p > 0}
     lp_mu = sum(lp.values()) / len(lp) if lp else 0.0
     lp_sd = math.sqrt(sum((v - lp_mu) ** 2 for v in lp.values()) / len(lp)) if lp else 1.0
@@ -280,12 +291,16 @@ def model_forecast(reads, places):
         exit_h = None
         if uid in born:
             exit_h = (28.0 * 86400.0 - (last['t'] - born[uid])) / 3600.0
+        ten = TENURE_W * age_days.get(uid, 0.0)
         acc = [0.0] * places
         for h in hs:
             if exit_h is not None and h > exit_h:
                 continue
+            a, b, c, sd_of, off_p = fits[0] if h <= HORIZON_SPLIT else fits[1]
             lg = math.log(h)
-            mu = a + b * math.log(r0) + c * lg + drift * min(h, DRIFT_CAP_H) / 24.0 + shift
+            mu = (a + b * math.log(r0) + c * lg
+                  + drift * min(h, DRIFT_CAP_H) / 24.0
+                  + ten * min(h, DRIFT_CAP_H) / 24.0 + shift)
             sd = sd_of(lg) * SD_MULT
             keep = 1.0 - off_p(h, r0)
             for k in range(1, places + 1):
@@ -302,9 +317,10 @@ def model_forecast(reads, places):
 # v1 forecaster (weight W_V1 in the ensemble)
 # ---------------------------------------------------------------------------
 
-def fit_diffusion_v1(reads):
+def fit_diffusion_v1(reads, gap_lo=None, gap_hi=None):
     """Least-squares fit of ln r' ~ a + b ln r + c ln gap, spread by gap,
-    and a per-gap off-chart rate. Returns (a, b, c, sd_of, off_p) or None."""
+    and a per-gap off-chart rate. Returns (a, b, c, sd_of, off_p) or None.
+    gap_lo/gap_hi restrict the fitted pairs by gap hours (v5 horizon mix)."""
     xs, ys, gs = [], [], []
     off = {}
     for i in range(len(reads)):
@@ -313,6 +329,10 @@ def fit_diffusion_v1(reads):
             rj = reads[j]
             gap = (rj['t'] - ri['t']) / 3600.0
             if gap <= 0:
+                continue
+            if gap_lo is not None and gap < gap_lo:
+                continue
+            if gap_hi is not None and gap > gap_hi:
                 continue
             lg = math.log(gap)
             key = round(lg * 2) / 2
@@ -398,22 +418,32 @@ def drifts_v1(reads, uid):
 
 def model_forecast_v1(reads, places):
     """The v1 forecaster: returns (raw, targets) or None."""
-    fit = fit_diffusion_v1(reads)
-    if fit is None:
+    fit_s = fit_diffusion_v1(reads, gap_hi=HORIZON_SPLIT)
+    fit_l = fit_diffusion_v1(reads, gap_lo=HORIZON_SPLIT)
+    if fit_s is None or fit_l is None:
         return None
-    a, b, c, sd_of, off_p = fit
+    fits = (fit_s, fit_l)
     targets = coverage_targets(reads, places)
     last = reads[-1]
+    first_seen = {}
+    for rd in reads:
+        for uid in rd['rank']:
+            first_seen.setdefault(uid, rd['t'])
+    age_days = {uid: (last['t'] - t0) / 86400.0 for uid, t0 in first_seen.items()}
     raw = {}
     hs = list(range(1, 73))
     for uid in sorted(last['rank'], key=lambda u: last['rank'][u]):
         r0 = last['rank'][uid]
         mu_rank, mu_play = drifts_v1(reads, uid)
         drift = KAPPA_RANK * mu_rank - KAPPA_PLAY * mu_play
+        ten = TENURE_W * age_days.get(uid, 0.0)
         acc = [0.0] * places
         for h in hs:
+            a, b, c, sd_of, off_p = fits[0] if h <= HORIZON_SPLIT else fits[1]
             lg = math.log(h)
-            mu = a + b * math.log(r0) + c * lg + drift * min(h, 48.0) / 24.0
+            mu = (a + b * math.log(r0) + c * lg
+                  + drift * min(h, 48.0) / 24.0
+                  + ten * min(h, 48.0) / 24.0)
             sd = sd_of(lg) * SD_MULT
             keep = 1.0 - off_p(h)
             for k in range(1, places + 1):
